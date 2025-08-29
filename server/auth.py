@@ -125,9 +125,7 @@ class UpdateIn(BaseModel):
     current_password: str | None = None
     new_password: str | None = None
 
-# =====================================================
-# Routes — parity with your Flask blueprint
-# =====================================================
+
 
 @router.post("/register", status_code=201)
 def register(data: RegisterIn):
@@ -195,7 +193,7 @@ def login(body: LoginIn):
 
 @router.post("/refresh")
 def refresh(request: Request):
-    # Match Flask's @jwt_required(refresh=True): expect Bearer refresh token in Authorization
+    
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing refresh token")
@@ -210,7 +208,6 @@ def refresh(request: Request):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    # Issue a new access token; Flask keeps identity as string
     new_access = create_access_token(uid)
     return {"access_token": new_access}
 

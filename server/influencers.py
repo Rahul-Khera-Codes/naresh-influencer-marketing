@@ -13,7 +13,8 @@ from datetime import datetime
 import time
 import random
 from functools import lru_cache
-
+from fastapi import Depends
+from auth import get_current_user
 load_dotenv()
 
 router = APIRouter()
@@ -29,33 +30,11 @@ OPENAI_KEY = os.getenv("OPENAI_KEY")
 
 
 
-def estimate_price_from_followers(followers: int) -> dict:
-    # simple pricing: base CPM increases with follower size
-    if followers <= 0:
-        followers = 0
-    cpm = 5 + (log10(followers + 1) * 2)
-    # price per post = (followers / 1000) * cpm
-    price_per_post = max(10, (followers / 1000.0) * cpm * 10)
-    return {"cpm": round(cpm, 2), "price_per_post": round(price_per_post, 2)}
-
-
-def compute_match_score(query: str | None, influencer: dict) -> int:
-    # rudimentary score based on keyword overlap
-    score = 50
-    if not query:
-        return score
-    q = query.lower()
-    text = " ".join([str(influencer.get(k, "")) for k in ("username", "bio", "category", "location")]).lower()
-    matches = sum(1 for token in q.split() if token and token in text)
-    score += min(50, matches * 10)
-    return max(0, min(100, score))
-
-
 
 
 
 @router.get("/search/top")
-def search_top_influencers(keyword: str, limit: int = 10, user_id: str | None = None):
+def search_top_influencers(keyword: str, limit: int = 10, user_id: str | None = None, current_user: dict = Depends(get_current_user)):
     """
     Search top influencers by keyword using Mongo cache + RapidAPI.
     - Cache key: normalized keyword + limit
@@ -208,235 +187,10 @@ def search_top_influencers(keyword: str, limit: int = 10, user_id: str | None = 
 
     return {"results": results, "cached": False}
 
-class SummaryPayload(BaseModel):
-    username: str
-    bio: str | None = None
-    # optional metrics to include in the prompt
-    post_count: int | None = None
-    avg_likes: int | None = None
-    engagement: int | None = None
-    engagement_rate_percent: float | None = None
-    followers: int | None = None
-    total_posts: int | None = None
-    # profile fields
-    user_id: str | None = None
-    full_name: str | None = None
-    follower_count: int | None = None
-    media_count: int | None = None
-    profile_pic_url: str | None = None
-
-@router.post("/summary/ai")
-def influencer_ai_summary(payload: SummaryPayload):
-    """
-    Generate a human-friendly AI summary for an influencer.
-    Uses OpenAI chat completions. The prompt includes supplied metrics (if provided)
-    so the model can produce a concise, simple, non-robotic summary and a short collaboration suggestion.
-    """
-    if not OPENAI_KEY:
-        raise HTTPException(status_code=500, detail="No OpenAI API key configured")
-
-    # system prompt: persona + style instructions (humanized, simple words, friendly)
-    system_prompt = (
-        "You are an expert influencer marketing analyst who writes short, human-friendly "
-        "summaries for brand teams. Use simple, conversational language (not robotic or overly formal). "
-        
-        "Keep the summary concise (3-5 sentences). Highlight the creator's niche, audience size, "
-        "typical engagement, and one quick suggestion for brand collaboration. If metrics are missing, "
-        "make reasonable neutral statements (e.g., 'metrics not available')."
-    )
-
-    # Build user prompt with all available data (metrics first, then bio)
-    parts = [f"Username: @{payload.username}"]
-    if payload.full_name:
-        parts.append(f"Full name: {payload.full_name}")
-    if payload.user_id:
-        parts.append(f"User ID: {payload.user_id}")
-    # include both follower_count and followers if present
-    if payload.follower_count is not None:
-        parts.append(f"Follower count (profile): {payload.follower_count}")
-    if payload.followers is not None:
-        parts.append(f"Followers (enriched): {payload.followers}")
-    if payload.media_count is not None:
-        parts.append(f"Total posts (profile): {payload.media_count}")
-    if payload.total_posts is not None:
-        parts.append(f"Total posts (enriched): {payload.total_posts}")
-    if payload.post_count is not None:
-        parts.append(f"Recent post count used for metrics: {payload.post_count}")
-    if payload.avg_likes is not None:
-        parts.append(f"Average likes per post: {payload.avg_likes}")
-    if payload.engagement is not None:
-        parts.append(f"Total engagement (likes+comments): {payload.engagement}")
-    if payload.engagement_rate_percent is not None:
-        parts.append(f"Engagement rate: {payload.engagement_rate_percent}%")
-    if payload.profile_pic_url:
-        parts.append(f"Profile image: {payload.profile_pic_url}")
-    parts.append(f"Bio: {payload.bio or 'N/A'}")
-
-    user_prompt = "Here is the influencer data:\n\n" + "\n".join(parts) + (
-        "\n\nPlease write a short, friendly, easy-to-read summary (3-5 sentences) suitable for a brand "
-        "brief. End with one succinct suggestion for a potential brand collaboration or content idea."
-    )
-
-    body = {
-        "model": "gpt-3.5-turbo",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.7,
-        "max_tokens": 500,
-    }
-
-    try:
-        headers = {"Authorization": f"Bearer {OPENAI_KEY}", "Content-Type": "application/json"}
-        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=30.0)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"OpenAI request error: {e}")
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"OpenAI error: {resp.text}")
-
-    data = resp.json()
-    text_out = ""
-    try:
-        text_out = data.get("choices", [])[0].get("message", {}).get("content", "").strip()
-    except Exception:
-        text_out = ""
-
-    if not text_out:
-        raise HTTPException(status_code=502, detail="Failed to generate summary")
-
-    return {"username": payload.username, "summary": text_out}
-
-def fetch_rapid_user_metrics(username: str) -> dict:
-    """
-    Fetch detailed metrics for a single username from RapidAPI.
-    Returns a dict with keys: username, followers, avg_likes, engagement, profile_pic, full_name, bio
-    """
-    url = f"{RAPIDAPI_BASE}/v1/user/by/username"
-    headers = {
-        "X-RapidAPI-Host": RAPIDAPI_HOST,
-        "X-RapidAPI-Key": RAPIDAPI_KEY,
-    }
-    params = {"username": username}
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=15.0)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"RapidAPI request error: {e}")
-
-    if resp.status_code != 200:
-        # try to parse JSON error, otherwise return a safe empty structure
-        try:
-            err = resp.json()
-        except Exception:
-            err = resp.text
-        raise HTTPException(status_code=502, detail=f"RapidAPI error: {err}")
-
-    try:
-        data = resp.json()
-        # print("response data", data)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Invalid JSON from RapidAPI: {e}")
-
-    # Normalize fields (keys differ across APIs)
-    followers = data.get("follower_count") or data.get("followers") or data.get("followerCount") or data.get("followers_count")
-    avg_likes = data.get("avg_likes") or data.get("average_likes") or data.get("avgLikes") or data.get("avg_like")
-    # try derive avg_comments from common keys
-    avg_comments = (
-        data.get("avg_comments")
-        or data.get("average_comments")
-        or data.get("comments_avg")
-        or data.get("avg_comment")
-        or (data.get("comments") if isinstance(data.get("comments"), (int, float, str)) else None)
-    )
-    profile_pic = data.get("profile_pic_url") or data.get("profile_picture") or data.get("profile_pic") or data.get("avatar")
-    full_name = data.get("full_name") or data.get("name") or data.get("fullName")
-    bio = data.get("biography") or data.get("bio") or ""
-
-    # try common posts/media count
-    posts = data.get("media_count") or data.get("posts") or data.get("media") and None
-
-    # compute engagement metrics
-    computed = compute_engagement_metrics(followers=followers, avg_likes=avg_likes, avg_comments=avg_comments, posts=posts)
-
-    return {
-        # include raw for debugging if needed
-        "raw": data,
-    }
-
-@router.get("/profile")
-def get_influencer_profile(username: str):
-    """
-    Return enriched profile metrics for a single username.
-    """
-    if not username:
-        raise HTTPException(status_code=400, detail="username is required")
-    try:
-        metrics = fetch_rapid_user_metrics(username)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return metrics
-
-
-
-def _parse_count(value):
-    """
-    Parse strings like "1.2M", "3,400" or numeric values into an int.
-    Returns int or None.
-    """
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    s = str(value).strip()
-    if not s:
-        return None
-    s = s.replace(",", "")
-    m = re.match(r"^([\d\.]+)\s*([kKmMbB]?)$", s)
-    if m:
-        num = float(m.group(1))
-        suf = m.group(2).lower()
-        if suf == "k":
-            num *= 1_000
-        elif suf == "m":
-            num *= 1_000_000
-        elif suf == "b":
-            num *= 1_000_000_000
-        return int(num)
-    try:
-        return int(float(s))
-    except Exception:
-        return None
-
-
-def compute_engagement_metrics(followers=None, avg_likes=None, avg_comments=None, posts=None) -> dict:
-    """
-    Compute engagement totals and engagement rate percent.
-    - followers, avg_likes, avg_comments may be numeric or strings like "1.2K".
-    - Returns {"engagement": int, "engagement_rate_percent": float | None}
-    """
-    f = _parse_count(followers)
-    likes = _parse_count(avg_likes)
-    comments = _parse_count(avg_comments)
-
-    likes = likes or 0
-    comments = comments or 0
-    total_engagement = likes + comments
-
-    eng_rate = None
-    if f and f > 0:
-        eng_rate = round((total_engagement / f) * 100, 3)  # percent with 3 decimals
-
-    return {"engagement": int(total_engagement), "engagement_rate_percent": eng_rate}
-
-
-
 
 
 @router.get("/insights")
-def user_insights(username: str | None = None, media_id: str | None = None, user_id: str | None = None):
+def user_insights(username: str | None = None, media_id: str | None = None, user_id: str | None = None, current_user: dict = Depends(get_current_user)):
     """
     Client endpoint. Accepts:
       - ?user_id=... -> fetch aggregated feed metrics for that user (preferred)
@@ -466,16 +220,11 @@ def get_insights(username: str = None, media_id: str | None = None, user_id: str
     """
     print(f"[DEBUG] get_insights called with user_id={user_id}, username={username}, media_id={media_id}")
     # resolve user_id if only username is provided
-    if not user_id and username:
-        try:
-            profile = fetch_rapid_user_metrics(username)
-            user_id = profile.get("pk") or profile.get("id") or (profile.get("raw") or {}).get("pk") or (profile.get("raw") or {}).get("id")
-            print(f"[DEBUG] get_insights resolved user_id={user_id} from username={username}")
-        except Exception as e:
-            print(f"[DEBUG] get_insights failed to resolve user_id from username={username}: {e}")
-            user_id = None
+
+    
 
     if not user_id:
+        
         print(f"[DEBUG] get_insights missing user_id for username={username}")
         raise HTTPException(status_code=400, detail="user_id (pk) is required to fetch feed insights.")
 
@@ -555,7 +304,8 @@ def get_insights(username: str = None, media_id: str | None = None, user_id: str
             "engagement": engagement,
             "engagement_rate_percent": engagement_rate,
             "followers": followers,
-            "total_posts": media_count
+            "total_posts": media_count,
+            
         }
         print(f"[DEBUG] get_insights result for user_id={user_id}: {result}")
         return result
@@ -570,7 +320,10 @@ def get_insights(username: str = None, media_id: str | None = None, user_id: str
         result = fetch_and_parse()
 
     return result
-def fetch_rapid_follower_profile(user_id: str) -> dict:
+
+
+@router.get("/profile")
+def fetch_rapid_follower_profile(user_id: str, current_user: dict = Depends(get_current_user)) -> dict:
     """
     Fetch profile info from RapidAPI /profile endpoint.
     Returns {follower_count, media_count, username, full_name, ...}
@@ -621,13 +374,6 @@ def fetch_rapid_follower_profile(user_id: str) -> dict:
     }
     
     
-@router.get("/followers")
-def get_followers(user_id: str, next_max_id: str | None = None):
-    """
-    GET /influencers/followers?user_id=12345[&next_max_id=...]
-    Returns RapidAPI followers page for the given user_id.
-    """
-    return fetch_rapid_follower_profile(user_id=user_id)
 
 
 @router.get("/fetch_rapid_followers")
@@ -682,6 +428,8 @@ def generate_summary(request: SummaryRequest):
         "Weaknesses & Risks, Recommended Collaboration Types & Creative Angles, Pricing Guidance (estimate), "
         "Actionable Next Steps, and an Appendix with raw metrics. When metrics are missing, explicitly note that and "
         "qualify recommendations. End with 5 concise bullet-point next steps for a brand. Be practical and tactical."
+        "Pricing Fairness Check: Compare the calculated price-per-post ($<price_per_post>) to the influencer’s typical quote (if provided) and state whether it appears fair, 10–20 % above market, or a bargain."
+        "Campaign Forecast: Estimate likely reach (followers × engagement rate × 0.8) and ballpark clicks (reach × 2 %) for a single sponsored post."
     )
 
     # Build a detailed user prompt including all available metrics
@@ -719,7 +467,7 @@ def generate_summary(request: SummaryRequest):
     )
 
     body = {
-        "model": "gpt-3.5-turbo",
+        "model": "gpt-4.1",
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
